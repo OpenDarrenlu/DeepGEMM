@@ -52,6 +52,8 @@ try:
         # BF16 GEMMs
         bf16_gemm_nt, bf16_gemm_nn,
         bf16_gemm_tn, bf16_gemm_tt,
+        bf16_gemm_reduce_scatter_nt,
+        reduce_scatter_comm,
         m_grouped_bf16_gemm_nt_contiguous,
         m_grouped_bf16_gemm_nn_contiguous,
         m_grouped_bf16_gemm_nt_masked,
@@ -88,6 +90,16 @@ from .mega import (
     transform_weights_for_mega_moe_sm90,
     fp8_fp4_mega_moe,
     fp8_mega_moe,
+)
+
+from .comm import (
+    ReduceScatterBuffer,
+    bf16_gemm_reduce_scatter,
+    ReduceScatterBufferPull,
+    bf16_gemm_reduce_scatter_pull,
+    bf16_gemm_reduce_scatter_split,
+    ReduceScatterBufferAuto,
+    bf16_gemm_reduce_scatter_auto,
 )
 
 # Some utils

@@ -210,6 +210,17 @@ CUTLASS_DEVICE void red_add_rel_sys(const int* ptr, const int& value) {
     asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
 }
 
+// Floating-point reductions for cross-rank reduce-scatter accumulation.
+// `.sys` scope so the reduction is visible across peer GPUs over NVLink.
+CUTLASS_DEVICE void red_add_sys(const float* ptr, const float& value) {
+    asm volatile("red.sys.global.add.f32 [%0], %1;" :: "l"(ptr), "f"(value));
+}
+
+CUTLASS_DEVICE void red_add_sys(const __nv_bfloat162* ptr, const __nv_bfloat162& value) {
+    asm volatile("red.sys.global.add.noftz.bf16x2 [%0], %1;"
+                 :: "l"(ptr), "r"(*reinterpret_cast<const uint32_t*>(&value)));
+}
+
 CUTLASS_DEVICE int ld_acq_sys(const int* ptr) {
     int ret;
     asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));

@@ -8,6 +8,9 @@
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
+#include "../jit_kernels/impls/sm100_bf16_gemm_reduce_scatter.hpp"
+#include "../jit_kernels/impls/sm100_reduce_scatter_comm.hpp"
+#include "../jit_kernels/impls/sm100_reduce_scatter_comm_pull.hpp"
 #endif 
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
@@ -400,6 +403,48 @@ static void bf16_gemm_nt(const torch::Tensor& a,
     }
 }
 
+static void bf16_gemm_reduce_scatter_nt(const torch::Tensor& a,
+                                        const torch::Tensor& b,
+                                        const torch::Tensor& local_scratch,
+                                        const torch::Tensor& out_sym_buffer,
+                                        const std::vector<int64_t>& sym_buffer_ptrs,
+                                        const int& rank,
+                                        const std::string& compiled_dims) {
+    // Shape must be `[M, K] @ [N, K].T`
+    const auto major_a = get_major_type_ab(a);
+    const auto major_b = get_major_type_ab(b);
+
+    const auto [m , k ] = get_shape<2>(a);
+    const auto [n , k_] = get_shape<2>(b);
+    DG_HOST_ASSERT(k == k_);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+
+    // Reduce-scatter fusion is currently SM100-only
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "bf16_gemm_reduce_scatter_nt only supports SM100");
+    sm100_bf16_gemm_reduce_scatter(a, b, local_scratch, out_sym_buffer, sym_buffer_ptrs, rank,
+                                   m, n, k, major_a, major_b, compiled_dims);
+}
+
+static void reduce_scatter_comm(const torch::Tensor& local_scratch,
+                                const torch::Tensor& out_sym_buffer,
+                                const std::vector<int64_t>& sym_buffer_ptrs,
+                                const int& rank) {
+    const auto [m, n] = get_shape<2>(local_scratch);
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "reduce_scatter_comm only supports SM100");
+    sm100_reduce_scatter_comm(local_scratch, out_sym_buffer, sym_buffer_ptrs, rank, m, n);
+}
+
+static void reduce_scatter_comm_pull(const torch::Tensor& out_sym_buffer,
+                                     const std::vector<int64_t>& sym_buffer_ptrs,
+                                     const int& rank, const int& m, const int& n) {
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "reduce_scatter_comm_pull only supports SM100");
+    sm100_reduce_scatter_comm_pull(out_sym_buffer, sym_buffer_ptrs, rank, m, n);
+}
+
 static void bf16_gemm_nn(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& d,
@@ -671,6 +716,16 @@ static void register_apis(pybind11::module_& m) {
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
           py::arg("compiled_dims") = "nk");
+    m.def("bf16_gemm_reduce_scatter_nt", &bf16_gemm_reduce_scatter_nt,
+          py::arg("a"), py::arg("b"), py::arg("local_scratch"), py::arg("out_sym_buffer"),
+          py::arg("sym_buffer_ptrs"), py::arg("rank"),
+          py::arg("compiled_dims") = "nk");
+    m.def("reduce_scatter_comm", &reduce_scatter_comm,
+          py::arg("local_scratch"), py::arg("out_sym_buffer"),
+          py::arg("sym_buffer_ptrs"), py::arg("rank"));
+    m.def("reduce_scatter_comm_pull", &reduce_scatter_comm_pull,
+          py::arg("out_sym_buffer"), py::arg("sym_buffer_ptrs"),
+          py::arg("rank"), py::arg("m"), py::arg("n"));
     m.def("bf16_gemm_nn", &bf16_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,
