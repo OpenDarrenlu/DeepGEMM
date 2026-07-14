@@ -12,18 +12,39 @@ except Exception as exception:
 from .. import _C
 
 
+# Deterministic swap-AB token-tile size (BLOCK_M) for the fused RS kernel, as a function of
+# the per-rank token count ONLY. Both the Python buffer padding and the C++ launcher must
+# agree on this value (the launcher recomputes `min(128, m_pad/num_ranks)` which equals this),
+# so tiles are single-owner without any cross-language handshake.
+#   - per_rank <= 128 : BLOCK_M = round_up_16(per_rank)  -> exactly ONE tile/owner, no waste
+#   - per_rank  > 128 : BLOCK_M = 128 (the 4-stage TMEM cap: 4*BLOCK_M <= 512)
+# Each owner segment is then padded to a multiple of BLOCK_M so a full-BLOCK_M TMA store box
+# never straddles two owners; the epilogue batches the whole tile into 2 TMA stores.
+RS_STORE_BLOCK_M_MAX = 256
+
+def rs_block_m(m_per_rank: int) -> int:
+    bm = ((m_per_rank + 15) // 16) * 16          # round up to a multiple of 16
+    return min(bm, RS_STORE_BLOCK_M_MAX)
+
+
 class ReduceScatterBuffer:
-    """Symmetric buffer for the fused BF16 GEMM + ReduceScatter kernel.
+    """Symmetric buffer for the fused BF16 GEMM + ReduceScatter kernel (swap-AB).
 
     Layout (single symmetric allocation, shared across ranks over NVLink):
         [ barrier region (32 B) ]
-        [ FP32 output : m_per_rank x n ]
-        [ BF16 scratch: num_ranks x m_per_rank x n ]   (num_ranks slots)
+        [ FP32 output : m_per_rank_pad x n ]
+        [ BF16 scratch: num_ranks x m_per_rank_pad x n ]   (num_ranks slots)
 
     Semantics: each rank writes its BF16 partial contribution into the owner rank's
     scratch SLOT `rank` with a plain remote store (no atomic); the owner then sums its
     `num_ranks` slots in FP32 into the output region. Owner-side FP32 accumulation gives
     better accuracy than a BF16 NCCL reduce-scatter.
+
+    swap-AB padding: token(M) is the UMMA N-dim, tiled by BLOCK_M (=`rs_block_m`). Each
+    owner's per-rank segment is padded up to a multiple of BLOCK_M (`m_per_rank_pad`) so a
+    full-BLOCK_M TMA store box lands wholly inside one owner's slot (single-owner tiles).
+    The epilogue then batches the whole tile into 2 TMA stores instead of 16. Padded rows
+    carry zeros (their `a` rows are zero-padded) and are sliced off by `.output`.
     """
 
     # Must match `layout::Workspace::kNumBarrierSignalBytes`
@@ -36,9 +57,13 @@ class ReduceScatterBuffer:
         self.rank = group.rank()
         self.m = m
         self.n = n
-        self.m_per_rank = m // self.world_size
+        self.m_per_rank = m // self.world_size                        # real rows per rank
+        # Pad each owner segment up to a multiple of BLOCK_M (single-owner tiles)
+        self.block_m = rs_block_m(self.m_per_rank)
+        self.m_per_rank_pad = ((self.m_per_rank + self.block_m - 1) // self.block_m) * self.block_m
+        self.m_pad = self.m_per_rank_pad * self.world_size
 
-        shard_elems = self.m_per_rank * n
+        shard_elems = self.m_per_rank_pad * n                         # padded slot size
         num_out_bytes = shard_elems * torch.float32.itemsize
         num_scratch_bytes = self.world_size * shard_elems * torch.bfloat16.itemsize
         num_bytes = self.BARRIER_BYTES + num_out_bytes + num_scratch_bytes
@@ -57,9 +82,10 @@ class ReduceScatterBuffer:
 
     @property
     def output(self) -> torch.Tensor:
-        # FP32 [m_per_rank, n] view of the output region
+        # FP32 [m_per_rank, n] view of the output region (padded tail rows sliced off)
         data = self.buffer[self.BARRIER_BYTES:self.BARRIER_BYTES + self._out_bytes]
-        return data.view(torch.float32).view(self.m_per_rank, self.n)
+        padded = data.view(torch.float32).view(self.m_per_rank_pad, self.n)
+        return padded[:self.m_per_rank]
 
     def zero_(self):
         # Clear barrier + scratch (output is fully overwritten by the combine pass).
@@ -82,14 +108,30 @@ def bf16_gemm_reduce_scatter(a: torch.Tensor,
     `a`: `[M, K]` bf16, `b`: `[N, K]` bf16 (NT layout). Every rank passes its own partial
     `a`/`b`; the output is reduced (summed) across ranks and scattered along M. Returns
     this rank's `[M // world_size, N]` FP32 shard. BF16 over NVLink + plain stores (no
-    remote atomics) + owner-side FP32 combine. Fastest at small/medium M (decode).
+    remote atomics) + owner-side FP32 combine. swap-AB tiles token(M) as the UMMA N-dim,
+    so it stays efficient at small M (decode).
     """
     # Fresh accumulation target every call
     rs_buffer.zero_()
-    m, _ = a.shape
+    m, k = a.shape
     n, _ = b.shape
-    # Local BF16 [M, N] scratch for the phase-1 GEMM output before the push
-    local_scratch = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    ws = rs_buffer.world_size
+    m_per_rank = rs_buffer.m_per_rank
+    m_per_rank_pad = rs_buffer.m_per_rank_pad
+
+    # Repack `a` into the padded owner-segment layout [world_size * m_per_rank_pad, K]:
+    # owner `o` occupies rows [o*m_per_rank_pad, o*m_per_rank_pad + m_per_rank); the padded
+    # tail rows are zeros (contribute 0 to the GEMM, sliced off by `.output`).
+    if m_per_rank_pad != m_per_rank:
+        if not a.is_contiguous():
+            a = a.contiguous()
+        a = a.view(ws, m_per_rank, k)
+        a = torch.nn.functional.pad(a, (0, 0, 0, m_per_rank_pad - m_per_rank))
+        a = a.reshape(ws * m_per_rank_pad, k)
+    m_pad = a.shape[0]
+
+    # Local BF16 [m_pad, n] scratch (kept for signature compat; unused by the fused push)
+    local_scratch = torch.empty((m_pad, n), dtype=torch.bfloat16, device=a.device)
     _C.bf16_gemm_reduce_scatter_nt(
         a, b, local_scratch, rs_buffer.buffer, rs_buffer.buffer_ptrs, rs_buffer.rank, compiled_dims)
     # Make peers' pushes visible (the kernel's NVLink barrier already syncs, but

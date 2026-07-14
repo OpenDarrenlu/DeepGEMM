@@ -1,10 +1,22 @@
 #pragma once
 
+#include <cuda.h>
+
 #include <deep_gemm/common/exception.cuh>
 
 namespace deep_gemm::layout {
 
 constexpr static uint32_t kNumMaxRanks = 72;
+
+// A fixed-size array of TMA CD descriptors, one per owner rank, passed to the fused
+// reduce-scatter kernel as a `__grid_constant__` param so the epilogue can TMA-store a
+// tile directly into the owner rank's peer symmetric slot (verified: SM100 TMA can write
+// peer memory over NVLink). Sized to the max so the host-side launcher `Args` is not
+// templated; the kernel receives only its `kNumRanks` prefix.
+template <uint32_t kNumRanks = kNumMaxRanks>
+struct CdTmaMaps {
+    CUtensorMap maps[kNumRanks];
+};
 
 template <uint32_t kNumRanks = kNumMaxRanks>
 struct SymBuffer {

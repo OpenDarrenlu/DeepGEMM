@@ -243,6 +243,32 @@ static CUtensorMap make_tma_cd_desc(const torch::Tensor& t,
                             allow_tf32);
 }
 
+// CD TMA descriptor from a RAW global pointer (may point to a PEER GPU's memory over P2P).
+// Bypasses torch's device-tracked tensor (from_blob would reject a peer pointer whose device
+// differs from the current one). Only dtype + the raw pointer value matter for encoding.
+static CUtensorMap make_tma_cd_desc_raw(void* gmem_ptr, const at::ScalarType& dtype,
+                                        const int& shape_m, const int& shape_n,
+                                        const int& block_m, const int& block_n,
+                                        const int& outer_stride,
+                                        const int& swizzle_mode, const int& swizzle_base = 0) {
+    const auto elem_size = static_cast<int>(c10::elementSize(dtype));
+    int smem_inner_dim = block_n;
+    if (swizzle_mode != 0)
+        smem_inner_dim = swizzle_mode / elem_size;
+
+    CUtensorMap tensor_map;
+    const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(shape_n), static_cast<cuuint64_t>(shape_m)};
+    const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim), static_cast<cuuint32_t>(block_m)};
+    const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(outer_stride * elem_size), };
+    const cuuint32_t elem_strides[2] = {1, 1};
+    DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
+        &tensor_map, aten_dtype_to_tensor_map_dtype(dtype, /*allow_tf32=*/false, /*fp4_unpacked_smem=*/true),
+        2, gmem_ptr, gmem_dims, gmem_strides, smem_dims, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return tensor_map;
+}
+
 static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                                     const torch::Tensor& t,
                                     int shape_mn, int shape_k,

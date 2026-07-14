@@ -182,9 +182,10 @@ struct SM100ArchSpec {
 
         // TODO: remove SF barriers for BF16 GEMMs
         // TMA full/empty barriers, with-SF full barriers, tensor memory full/empty barriers
-        // NOTES: some shapes may only have 1 epilogue stage, but we still allocate space for 2 stages
+        // NOTES: reserve space for up to 4 epilogue stages (the fused reduce-scatter kernel
+        //        uses 4-stage TMEM double-buffering; dense GEMM uses 2 and just over-reserves)
         // NOTES: the last barrier is for tensor core utilization control
-        const int smem_barriers = kNumMaxStages * 8 * 3 + 2 * 8 * 2 + 8;
+        const int smem_barriers = kNumMaxStages * 8 * 3 + 4 * 8 * 2 + 8;
 
         // Tensor memory pointer
         const int smem_tmem_ptr = 4;
