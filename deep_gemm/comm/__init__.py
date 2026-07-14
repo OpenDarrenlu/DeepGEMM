@@ -270,3 +270,78 @@ def bf16_gemm_reduce_scatter_split(a: torch.Tensor,
     _C.reduce_scatter_comm(local_scratch, rs_buffer.buffer, rs_buffer.buffer_ptrs, rs_buffer.rank)
     rs_buffer.group.barrier()
     return rs_buffer.output
+class ReduceScatterRingBuffer:
+    """Symmetric buffer for the standalone PUSH-RING reduce-scatter comm kernel
+    (`_C.reduce_scatter_ring`).
+
+    Layout (single symmetric allocation, shared across ranks over NVLink):
+        [ barrier region (32 B) ]
+        [ output   : m_per_rank x n  bf16 ]
+        [ ring recv: num_ranks x m_per_rank x n  bf16 ]   (one owner slot each)
+        [ flags    : num_ranks x int32 ]                  (per-owner ready flag)
+
+    Ring reduce-scatter: each rank pushes its running partial-sum downstream (rank->rank-1),
+    adding the upstream partial at each hop; after num_ranks-1 hops the sum lands at the
+    owner's output. Reduction folded into transfer (no separate combine pass). Output is
+    BF16 (fp32 hadd internally per hop -> actually bf16 hadd; matches NCCL precision).
+    """
+
+    BARRIER_BYTES = 32
+
+    def __init__(self, group: 'dist.ProcessGroup', m: int, n: int):
+        assert m % group.size() == 0, 'M must be divisible by world size'
+        self.group = group
+        self.world_size = group.size()
+        self.rank = group.rank()
+        self.m, self.n = m, n
+        self.m_per_rank = m // self.world_size
+
+        shard_elems = self.m_per_rank * n
+        self._out_bytes = shard_elems * torch.bfloat16.itemsize
+        ring_bytes = self.world_size * shard_elems * torch.bfloat16.itemsize
+        flag_bytes = self.world_size * 4                       # int32 per owner
+        num_bytes = self.BARRIER_BYTES + self._out_bytes + ring_bytes + flag_bytes
+
+        self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
+        self.handle = symm_mem.rendezvous(self.buffer, group=group)
+        self.buffer.zero_()
+        self.group.barrier()
+        torch.cuda.synchronize()
+
+    @property
+    def buffer_ptrs(self):
+        return self.handle.buffer_ptrs
+
+    @property
+    def output(self) -> torch.Tensor:
+        data = self.buffer[self.BARRIER_BYTES:self.BARRIER_BYTES + self._out_bytes]
+        return data.view(torch.bfloat16).view(self.m_per_rank, self.n)
+
+    def zero_(self):
+        # Ring + flags must be cleared every call (flags are consumed, ring accumulated).
+        self.buffer.zero_()
+        self.group.barrier()
+        torch.cuda.synchronize()
+
+    def destroy(self):
+        self.handle = None
+        self.buffer = None
+        self.group = None
+
+
+def bf16_gemm_reduce_scatter_ring(a: torch.Tensor,
+                                  b: torch.Tensor,
+                                  rs_buffer: ReduceScatterRingBuffer) -> torch.Tensor:
+    """Split-kernel RING reduce-scatter: plain BF16 GEMM -> bf16 scratch, then the standalone
+    push-ring comm kernel (bidirectional NVLink, reduction folded into transfer).
+    Returns this rank's [M//world_size, N] BF16 shard. Validation vehicle for the ring logic
+    before fusing it into the GEMM epilogue."""
+    from .. import bf16_gemm_nt
+    rs_buffer.zero_()
+    m, _ = a.shape
+    n, _ = b.shape
+    local_scratch = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    bf16_gemm_nt(a, b, local_scratch)
+    _C.reduce_scatter_ring(local_scratch, rs_buffer.buffer, rs_buffer.buffer_ptrs, rs_buffer.rank)
+    rs_buffer.group.barrier()
+    return rs_buffer.output

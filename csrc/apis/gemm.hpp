@@ -11,6 +11,7 @@
 #include "../jit_kernels/impls/sm100_bf16_gemm_reduce_scatter.hpp"
 #include "../jit_kernels/impls/sm100_reduce_scatter_comm.hpp"
 #include "../jit_kernels/impls/sm100_reduce_scatter_comm_pull.hpp"
+#include "../jit_kernels/impls/sm100_reduce_scatter_ring.hpp"
 #endif 
 
 #include "../jit_kernels/impls/smxx_cublaslt.hpp"
@@ -445,6 +446,16 @@ static void reduce_scatter_comm_pull(const torch::Tensor& out_sym_buffer,
     sm100_reduce_scatter_comm_pull(out_sym_buffer, sym_buffer_ptrs, rank, m, n);
 }
 
+static void reduce_scatter_ring(const torch::Tensor& local_scratch,
+                                const torch::Tensor& out_sym_buffer,
+                                const std::vector<int64_t>& sym_buffer_ptrs,
+                                const int& rank) {
+    const auto [m, n] = get_shape<2>(local_scratch);
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "reduce_scatter_ring only supports SM100");
+    sm100_reduce_scatter_ring(local_scratch, out_sym_buffer, sym_buffer_ptrs, rank, m, n);
+}
+
 static void bf16_gemm_nn(const torch::Tensor& a,
                          const torch::Tensor& b,
                          const torch::Tensor& d,
@@ -726,6 +737,9 @@ static void register_apis(pybind11::module_& m) {
     m.def("reduce_scatter_comm_pull", &reduce_scatter_comm_pull,
           py::arg("out_sym_buffer"), py::arg("sym_buffer_ptrs"),
           py::arg("rank"), py::arg("m"), py::arg("n"));
+    m.def("reduce_scatter_ring", &reduce_scatter_ring,
+          py::arg("local_scratch"), py::arg("out_sym_buffer"),
+          py::arg("sym_buffer_ptrs"), py::arg("rank"));
     m.def("bf16_gemm_nn", &bf16_gemm_nn,
           py::arg("a"), py::arg("b"), py::arg("d"),
           py::arg("c") = std::nullopt,

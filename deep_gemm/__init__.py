@@ -100,6 +100,8 @@ from .comm import (
     bf16_gemm_reduce_scatter_split,
     ReduceScatterBufferAuto,
     bf16_gemm_reduce_scatter_auto,
+    ReduceScatterRingBuffer,
+    bf16_gemm_reduce_scatter_ring,
 )
 
 # Some utils

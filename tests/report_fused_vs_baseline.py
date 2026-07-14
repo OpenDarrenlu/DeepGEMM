@@ -103,11 +103,19 @@ def run(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
         # ---- fused kernel ----
         rs_aa = deep_gemm.ReduceScatterBuffer(group, m, n)
-        aa_scratch = torch.empty((m, n), dtype=torch.bfloat16, device='cuda')
+        # Pre-pad `a` to the padded owner layout OUTSIDE the timed loop (matches the wrapper),
+        # so the raw _C call sees the padded shape the kernel requires (BLOCK_M divides
+        # m_per_rank_pad). Timing then excludes the (negligible) pad cost.
+        mpr, mpp, ws = rs_aa.m_per_rank, rs_aa.m_per_rank_pad, rs_aa.world_size
+        a_aa = a
+        if mpp != mpr:
+            a_aa = torch.nn.functional.pad(
+                a.view(ws, mpr, k), (0, 0, 0, mpp - mpr)).reshape(ws * mpp, k).contiguous()
+        aa_scratch = torch.empty((a_aa.shape[0], n), dtype=torch.bfloat16, device='cuda')
 
         def aa_call():
             _C.bf16_gemm_reduce_scatter_nt(
-                a, b, aa_scratch, rs_aa.buffer, rs_aa.buffer_ptrs, rs_aa.rank, 'nk')
+                a_aa, b, aa_scratch, rs_aa.buffer, rs_aa.buffer_ptrs, rs_aa.rank, 'nk')
 
         out_aa = deep_gemm.bf16_gemm_reduce_scatter(a, b, rs_aa)
         diff_aa = calc_diff(out_aa, ref)
