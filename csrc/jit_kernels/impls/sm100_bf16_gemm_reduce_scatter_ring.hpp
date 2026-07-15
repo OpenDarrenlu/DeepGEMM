@@ -35,6 +35,7 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
+{}
 #include <deep_gemm/impls/sm100_bf16_gemm_reduce_scatter_ring.cuh>
 
 using namespace deep_gemm;
@@ -52,6 +53,17 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+        (std::string(std::getenv("DG_RS_STGLOBAL") ? "#define DG_RS_STGLOBAL 1\n" : "") +
+         std::string(std::getenv("DG_RS_FAKE_PARTIAL") ? "#define DG_RS_FAKE_PARTIAL 1\n" : "") +
+         std::string(std::getenv("DG_RS_SKIP_AB_LOAD") ? "#define DG_RS_SKIP_AB_LOAD 1\n" : "") +
+         std::string(std::getenv("DG_RS_SKIP_MMA") ? "#define DG_RS_SKIP_MMA 1\n" : "") +
+         std::string(std::getenv("DG_RS_NO_STORE_WAIT") ? "#define DG_RS_NO_STORE_WAIT 1\n" : "") +
+         std::string(std::getenv("DG_RS_SKIP_STSM") ? "#define DG_RS_SKIP_STSM 1\n" : "") +
+         std::string(std::getenv("DG_RS_DIRECT") ? "#define DG_RS_DIRECT 1\n" : "") +
+         std::string(std::getenv("DG_RS_WG2_SOLO") ? "#define DG_RS_WG2_SOLO 1\n" : "") +
+         std::string(std::getenv("DG_RS_SKIP_ENTRY") ? "#define DG_RS_SKIP_ENTRY 1\n" : "") +
+         std::string(std::getenv("DG_RS_NO_FLAG") ? "#define DG_RS_NO_FLAG 1\n" : "") +
+         std::string(std::getenv("DG_RS_W3_NOLOAD") ? "#define DG_RS_W3_NOLOAD 1\n" : "")),
         to_string(args.gemm_desc.major_a), to_string(args.gemm_desc.major_b),
         get_compiled_dim(args.gemm_desc.n, 'n', args.gemm_desc.compiled_dims),
         get_compiled_dim(args.gemm_desc.k, 'k', args.gemm_desc.compiled_dims),
@@ -112,16 +124,17 @@ static void sm100_bf16_gemm_reduce_scatter_ring(const torch::Tensor& a,
         .tc_util = device_runtime->get_tc_util(), .compiled_dims = compiled_dims
     };
 
-    // Single-CTA swap-AB layout with a deterministic BLOCK_M (matches the Python wrapper's pad):
-    //   chosen_block_m = min(256, m_per_rank).  BLOCK_N locked to 128.
-    const int chosen_block_m = std::min(256, m / num_ranks);
+    // Single-CTA NON-swap layout: token(M)=UMMA_M=128, hidden(N)=UMMA_N=BLOCK_N=128. BLOCK_M LOCKED
+    // to 128 (owner-aligned token tile; m_per_rank padded to 128 by the wrapper). Standard (non-
+    // transposed) epilogue -> no STSM_T. Whole [128,128] tile per store + one segment flag.
+    const int chosen_block_m = 128;
     const auto all_candidates = SM100ArchSpec::get_layout_candidates(desc);
     std::vector<Layout> candidates;
     for (const auto& c: all_candidates) {
-        if (c.swap_ab and c.get_cluster_size() == 1 and c.block_n == 128 and c.block_m == chosen_block_m)
+        if (not c.swap_ab and c.get_cluster_size() == 1 and c.block_n == 128 and c.block_m == chosen_block_m)
             candidates.push_back(c);
     }
-    DG_HOST_ASSERT(not candidates.empty() and "No single-CTA swap-AB BLOCK_N=128 config at chosen BLOCK_M");
+    DG_HOST_ASSERT(not candidates.empty() and "No single-CTA non-swap BLOCK_M=BLOCK_N=128 config");
 
     auto layout = candidates[0];
     auto layout_info = SM100ArchSpec::get_layout_info(desc, layout);
@@ -137,33 +150,45 @@ static void sm100_bf16_gemm_reduce_scatter_ring(const torch::Tensor& a,
         .pipeline_config = SM100ArchSpec::get_pipeline_config(desc, layout, storage_config),
         .launch_config = SM100ArchSpec::get_launch_config(desc, layout)
     };
+    DG_HOST_ASSERT(config.layout.block_m == 128 and "fused ring requires BLOCK_M == 128");
     DG_HOST_ASSERT((m / num_ranks) % config.layout.block_m == 0 and
                    "owner segment must be a multiple of BLOCK_M (pad in the wrapper)");
     // 3 warpgroups = 384 threads (WG0 producer / WG1 epilogue / WG2 ring).
     config.launch_config.num_threads = 384;
+    // Whole-tile store: epi_smem/partial_buf hold [STORE_BLOCK_M, STORE_BLOCK_N] = [128,128].
+    // Override storage_config.store_block_m (heuristic gives 16 for swap-AB) so the CD tensor
+    // maps' smem box spans the full 128 token rows.
+    constexpr int kStoreBlockM = 128;
+    config.storage_config.store_block_m = kStoreBlockM;
 
-    // Recompute the A/B pipeline depth for THIS kernel's smem layout, which adds a
-    // double-buffered partial_buf and extra barrier sets on top of the base epi_smem/A/B.
-    // Device layout (bytes): [ epi_smem (CD, 2 stages) ][ partial_buf (2 stages) ]
-    //   [ A: ns stages ][ B: ns stages ][ barriers: (2*ns + 2*2 + 2*2 + 2*2) * 8 ][ tmem_ptr: 4 ].
+    // Recompute the A/B pipeline depth for THIS kernel's smem layout. Device layout (bytes):
+    //   [ partial_buf (part_stages of [128,128]) ][ A: ns ][ B: ns ]
+    //   [ barriers: (2*ns + tmem*2 + part*3)*8 ][ tmem_ptr: 4 ].   NO epi_smem.
+    // Stage counts — MUST match the kernel (.cuh): kNumEpilogueStages=4 (TMEM), kNumPartialStages=2.
+    // WG1 adds upstream in-registers and writes the running-sum into partial_buf; partial_buf has 3
+    // barrier groups (part_full w3->WG1, epi_full WG1->WG2, part_empty WG2->w3).
+    const int tmem_stages = 4;
+    const int part_stages = 2;
     {
         constexpr int kElem = 2;                    // bf16
-        constexpr int kStoreBlockM = 16, kStoreBlockN = 128;
-        constexpr int kEpiStages = 2, kTMAStoreStages = 2, kPartialStages = 2;
+        constexpr int kStoreBlockN = 128;
+        const int kEpiStages = tmem_stages, kPartialStages = part_stages;
         const int block_m = config.layout.block_m, block_n = config.layout.block_n, block_k = config.layout.block_k;
-        const int smem_cd      = kStoreBlockM * kStoreBlockN * kElem * kTMAStoreStages;   // epi_smem
-        const int smem_partial = kStoreBlockM * kStoreBlockN * kElem * kPartialStages;    // partial_buf
+        const int smem_partial = kStoreBlockM * kStoreBlockN * kElem * kPartialStages;    // partial_buf (only staging buf)
         const int smem_a_per   = block_m * block_k * kElem;
         const int smem_b_per   = block_n * block_k * kElem;
-        const int smem_fixed   = smem_cd + smem_partial + 4 /*tmem_ptr*/ + 1024 /*align slack*/;
+        const int smem_fixed   = smem_partial + 4 /*tmem_ptr*/ + 1024 /*align slack*/;
         auto device_smem = [&](int ns) {
-            const int barriers = (2 * ns + kEpiStages * 2 + kTMAStoreStages * 2 + kPartialStages * 2) * 8;
+            const int barriers = (2 * ns + kEpiStages * 2 + kPartialStages * 3) * 8;   // A/B + TMEM + partial(3 groups)
             return smem_fixed + ns * (smem_a_per + smem_b_per) + barriers;
         };
+        // Leave headroom below the opt-in max for the compiler's static smem (cutlass internals,
+        // printf buffers, etc.); dynamic+static must fit sharedMemPerMultiprocessor at 1 block/SM.
+        const int smem_budget = SM100ArchSpec::smem_capacity - 8192;
         int ns = 1;
-        while (ns + 1 <= 32 and device_smem(ns + 1) <= SM100ArchSpec::smem_capacity)
+        while (ns + 1 <= 32 and device_smem(ns + 1) <= smem_budget)
             ns += 1;
-        DG_HOST_ASSERT(device_smem(ns) <= SM100ArchSpec::smem_capacity and "smem overflow");
+        DG_HOST_ASSERT(device_smem(ns) <= smem_budget and "smem overflow");
         config.pipeline_config.num_stages = ns;
         config.pipeline_config.smem_size = device_smem(ns);
     }
@@ -189,7 +214,7 @@ static void sm100_bf16_gemm_reduce_scatter_ring(const torch::Tensor& a,
     auto* my_ring_ptr  = reinterpret_cast<void*>(my_base + barrier_bytes + out_bytes);
     auto* down_ring_ptr = reinterpret_cast<void*>(down_base + barrier_bytes + out_bytes);
 
-    // partial-load: read THIS rank's ring recv [R*m_per_rank, n], 16-row store blocks.
+    // partial-load: read THIS rank's ring recv [R*m_per_rank, n], whole-[128,128] store blocks.
     const auto tensor_map_partial_load = make_tma_cd_desc_raw(my_ring_ptr, torch::kBFloat16,
                                                               num_ranks * m_per_rank, n,
                                                               config.storage_config.store_block_m,

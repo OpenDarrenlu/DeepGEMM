@@ -66,6 +66,25 @@ def build_queues(rank, R, num_sms, num_m_blocks, num_n_blocks, bpo, k1d, stagger
     return queues
 
 
+def build_queues_segordered(rank, R, num_sms, bpo, num_n_blocks, stagger):
+    """SEGMENT-ORDERED enumeration: process owner segments in staggered order c=(rank+1+t)%R,
+    t=0..R-1; within a segment distribute its (off,nb) tiles grid-strided across SMs; a whole
+    segment is enumerated before the next. This is the order needed for a per-segment flag to be
+    deadlock-free (all of a segment completes as one contiguous phase, like the standalone RS)."""
+    queues = [[] for _ in range(num_sms)]
+    seg_tiles = bpo * num_n_blocks
+    for t in range(R):
+        c = (rank + 1 + t) % R if stagger else t
+        # enumerate this segment's tiles (off, nb) and hand them to SMs grid-strided
+        idx = 0
+        for off in range(bpo):
+            for nb in range(num_n_blocks):
+                sm = idx % num_sms
+                queues[sm].append((c, off, nb))
+                idx += 1
+    return queues
+
+
 def ring_state(rank, c, R):
     d = (rank - c + R) % R
     if d == R - 1:
@@ -75,9 +94,10 @@ def ring_state(rank, c, R):
     return "MIDDLE"      # waits upstream, forwards
 
 
-def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False):
+def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False,
+                    seg_flag=False, seg_order=False):
     m_per_rank = M // R
-    block_m = min(256, m_per_rank)
+    block_m = min(128, m_per_rank) if (seg_flag or seg_order) else min(256, m_per_rank)  # fused ring locks 128
     assert m_per_rank % block_m == 0, (m_per_rank, block_m)
     bpo = m_per_rank // block_m
     num_m_blocks = R * bpo
@@ -85,8 +105,12 @@ def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False):
     k1d = num_1d_blocks_per_group(block_m, block_n, num_sms)
 
     # Build queues for every rank.
-    all_q = [build_queues(i, R, num_sms, num_m_blocks, num_n_blocks, bpo, k1d, stagger)
-             for i in range(R)]
+    if seg_order:
+        all_q = [build_queues_segordered(i, R, num_sms, bpo, num_n_blocks, stagger)
+                 for i in range(R)]
+    else:
+        all_q = [build_queues(i, R, num_sms, num_m_blocks, num_n_blocks, bpo, k1d, stagger)
+                 for i in range(R)]
 
     # Node id = (rank, c, off, nb). Map each node -> (sm, pos) so we can add the in-order edge.
     # Build adjacency of "depends-on" edges.
@@ -98,6 +122,21 @@ def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False):
             for p, tile in enumerate(all_q[i][s]):
                 pos_of[(i, tile)] = (s, p)
 
+    # For segment-flag mode: per (rank, owner c) the LAST tile that rank processes for owner c
+    # (max global "position" across its SMs). Downstream's owner-c tiles depend on upstream
+    # having stored ALL of owner-c => depend on that upstream last-owner-c tile.
+    # Global processing order key = pos (iteration index within SM); use (pos, sm) as a proxy for
+    # "when" a tile completes. We take the upstream tile with the max pos for owner c.
+    seg_last = {}   # (rank, c) -> tile with max pos among that rank's owner-c tiles
+    if seg_flag:
+        for i in range(R):
+            for s in range(num_sms):
+                for p, tile in enumerate(all_q[i][s]):
+                    c = tile[0]
+                    key = (i, c)
+                    if key not in seg_last or p > seg_last[key][0]:
+                        seg_last[key] = (p, tile)
+
     def deps(node):
         i, tile = node
         c, off, nb = tile
@@ -107,11 +146,17 @@ def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False):
         if p > 0:
             prev = all_q[i][s][p - 1]
             out.append((i, prev))
-        # edge B: cross-rank, MIDDLE/END wait on upstream (i+1) same physical tile
+        # edge B: cross-rank upstream dependency (MIDDLE/END wait upstream)
         st = ring_state(i, c, R)
         if st in ("MIDDLE", "END"):
             up = (i + 1) % R
-            out.append((up, tile))
+            if seg_flag:
+                # SEGMENT flag: this tile can't start until upstream finished ALL of owner c,
+                # i.e. depends on upstream's LAST owner-c tile (which itself depends, via edge A,
+                # on every earlier upstream owner-c tile).
+                out.append((up, seg_last[(up, c)][1]))
+            else:
+                out.append((up, tile))   # per-tile flag
         return out
 
     # Iterative DFS cycle detection over all nodes.
@@ -168,15 +213,18 @@ if __name__ == "__main__":
     p.add_argument("--sms", type=int, default=148)
     p.add_argument("--tokens", type=str, default="512,1024,2048,4096,8192")
     p.add_argument("--n", type=int, default=4096)
+    p.add_argument("--seg-flag", action="store_true", help="model per-owner-segment flag deps (BLOCK_M=128)")
+    p.add_argument("--seg-order", action="store_true", help="segment-ordered processing (contiguous per owner)")
     args = p.parse_args()
 
     any_dead = False
     for stagger in (True, False):
-        print(f"\n===== stagger={stagger} | R={args.ranks} SMs={args.sms} n={args.n} =====")
+        print(f"\n===== stagger={stagger} seg_flag={args.seg_flag} seg_order={args.seg_order} | R={args.ranks} SMs={args.sms} n={args.n} =====")
         for m in (int(x) for x in args.tokens.split(",")):
             if (m // args.ranks) == 0:
                 continue
-            r = detect_deadlock(args.ranks, args.sms, m, args.n, stagger=stagger)
+            r = detect_deadlock(args.ranks, args.sms, m, args.n, stagger=stagger,
+                                seg_flag=args.seg_flag, seg_order=args.seg_order)
             tag = "DEADLOCK" if r["deadlock"] else "ok"
             extra = ""
             if r["deadlock"]:

@@ -364,6 +364,7 @@ class ReduceScatterRingFusedBuffer:
 
     BARRIER_BYTES = 32
     BLOCK_N = 128
+    BLOCK_M = 128     # LOCKED: the fused-ring kernel does whole-[128,128]-tile stores
 
     def __init__(self, group: 'dist.ProcessGroup', m: int, n: int):
         assert m % group.size() == 0, 'M must be divisible by world size'
@@ -373,7 +374,7 @@ class ReduceScatterRingFusedBuffer:
         self.rank = group.rank()
         self.m, self.n = m, n
         self.m_per_rank = m // self.world_size
-        self.block_m = rs_block_m(self.m_per_rank)
+        self.block_m = self.BLOCK_M
         self.m_per_rank_pad = ((self.m_per_rank + self.block_m - 1) // self.block_m) * self.block_m
         self.m_pad = self.m_per_rank_pad * self.world_size
         self.num_m_blocks = self.m_pad // self.block_m
@@ -382,7 +383,8 @@ class ReduceScatterRingFusedBuffer:
         shard_elems = self.m_per_rank_pad * n
         self._out_bytes = shard_elems * torch.bfloat16.itemsize
         ring_bytes = self.world_size * shard_elems * torch.bfloat16.itemsize
-        flag_bytes = self.num_m_blocks * self.num_n_blocks * 4       # int32 per tile
+        # Per-OWNER-SEGMENT flag protocol: R flags + R device-scope counters (int32 each).
+        flag_bytes = 2 * self.world_size * 4
         num_bytes = self.BARRIER_BYTES + self._out_bytes + ring_bytes + flag_bytes
 
         self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
