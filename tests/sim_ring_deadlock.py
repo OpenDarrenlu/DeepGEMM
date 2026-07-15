@@ -1,0 +1,188 @@
+"""Faithful deadlock simulator for the FUSED push-ring GEMM+RS kernel.
+
+The fused kernel has NO grid_sync between ring steps (unlike the standalone comm kernel).
+Instead every SM runs the GEMM persistent tile loop; WG2 (ring warp) processes each tile
+IN ORDER, and for a MIDDLE/END tile it WAITS on the upstream rank's flag for that SAME
+physical tile. Deadlock-freedom is therefore NOT automatic; it holds iff the combined
+dependency graph is acyclic:
+
+  edge A (per-SM in-order): WG2(rank i, queue pos p) depends on WG2(rank i, pos p-1)
+  edge B (cross-rank ring): WG2(rank i, tile X) depends on WG2(up=i+1, tile X) if X is MIDDLE/END
+
+A cycle in "depends-on" == a set of WG2 consumers each blocked on the next == hang.
+
+We replicate `get_swizzled_block_idx` (kIsMulticastOnA=false / grouping on M, kNumMulticast=1,
+arch>=1000 so the SM90 multicast fix is skipped) and `get_next_block` EXACTLY, then apply the
+stagger owner' = (owner_raw + rank + 1) % R and detect cycles.
+"""
+import argparse
+import sys
+
+
+def num_1d_blocks_per_group(block_m, block_n, num_sms):
+    # kIsMulticastOnA == false -> grouping on M
+    best, min_usage = 0, 1 << 62
+    for cand in (8, 16):
+        usage = cand * block_m + ((num_sms + cand - 1) // cand) * block_n
+        if usage < min_usage:
+            min_usage, best = usage, cand
+    return best
+
+
+def swizzled_block_idx(block_idx, num_m_blocks, num_n_blocks, k1d):
+    # kIsMulticastOnA == false: primary=M, secondary=N
+    primary = num_m_blocks
+    secondary = num_n_blocks
+    num_blocks_per_group = secondary * k1d
+    group_idx = block_idx // num_blocks_per_group
+    first_block_idx = group_idx * k1d
+    in_group_idx = block_idx % num_blocks_per_group
+    num_blocks_in_group = min(k1d, primary - first_block_idx)
+    # arch>=1000: no multicast fix
+    m_block_idx = first_block_idx + in_group_idx % num_blocks_in_group
+    n_block_idx = in_group_idx // num_blocks_in_group
+    return m_block_idx, n_block_idx
+
+
+def build_queues(rank, R, num_sms, num_m_blocks, num_n_blocks, bpo, k1d, stagger):
+    """Return per-SM ordered list of physical tiles (c, off, nb) for this rank."""
+    num_blocks = num_m_blocks * num_n_blocks
+    queues = [[] for _ in range(num_sms)]
+    for s in range(num_sms):
+        it = 0
+        while True:
+            gbi = it * num_sms + s
+            if gbi >= num_blocks:
+                break
+            it += 1
+            raw_m, nb = swizzled_block_idx(gbi, num_m_blocks, num_n_blocks, k1d)
+            owner_raw = raw_m // bpo
+            off = raw_m % bpo
+            if stagger:
+                c = (owner_raw + rank + 1) % R
+            else:
+                c = owner_raw
+            queues[s].append((c, off, nb))
+    return queues
+
+
+def ring_state(rank, c, R):
+    d = (rank - c + R) % R
+    if d == R - 1:
+        return "START"   # no upstream wait
+    if d == 0:
+        return "END"     # i==c, waits upstream, writes output
+    return "MIDDLE"      # waits upstream, forwards
+
+
+def detect_deadlock(R, num_sms, M, N, block_n=128, stagger=True, verbose=False):
+    m_per_rank = M // R
+    block_m = min(256, m_per_rank)
+    assert m_per_rank % block_m == 0, (m_per_rank, block_m)
+    bpo = m_per_rank // block_m
+    num_m_blocks = R * bpo
+    num_n_blocks = (N + block_n - 1) // block_n
+    k1d = num_1d_blocks_per_group(block_m, block_n, num_sms)
+
+    # Build queues for every rank.
+    all_q = [build_queues(i, R, num_sms, num_m_blocks, num_n_blocks, bpo, k1d, stagger)
+             for i in range(R)]
+
+    # Node id = (rank, c, off, nb). Map each node -> (sm, pos) so we can add the in-order edge.
+    # Build adjacency of "depends-on" edges.
+    # For cycle detection we use iterative DFS with colors.
+    # Represent node as tuple.
+    pos_of = {}          # (rank, tile) -> (sm, pos)
+    for i in range(R):
+        for s in range(num_sms):
+            for p, tile in enumerate(all_q[i][s]):
+                pos_of[(i, tile)] = (s, p)
+
+    def deps(node):
+        i, tile = node
+        c, off, nb = tile
+        out = []
+        s, p = pos_of[(i, tile)]
+        # edge A: in-order within SM (depends on previous tile in same SM queue)
+        if p > 0:
+            prev = all_q[i][s][p - 1]
+            out.append((i, prev))
+        # edge B: cross-rank, MIDDLE/END wait on upstream (i+1) same physical tile
+        st = ring_state(i, c, R)
+        if st in ("MIDDLE", "END"):
+            up = (i + 1) % R
+            out.append((up, tile))
+        return out
+
+    # Iterative DFS cycle detection over all nodes.
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {}
+    nodes = list(pos_of.keys())
+    for n in nodes:
+        color[n] = WHITE
+
+    cycle = None
+    for start in nodes:
+        if color[start] != WHITE:
+            continue
+        stack = [(start, iter(deps(start)))]
+        color[start] = GRAY
+        path = [start]
+        while stack:
+            node, it = stack[-1]
+            advanced = False
+            for nb_node in it:
+                if nb_node not in color:
+                    # tile not present in upstream's queue -> would wait forever!
+                    cycle = ("MISSING_UPSTREAM", node, nb_node)
+                    return False_result(cycle, block_m, bpo, num_m_blocks, num_n_blocks, k1d)
+                if color[nb_node] == WHITE:
+                    color[nb_node] = GRAY
+                    stack.append((nb_node, iter(deps(nb_node))))
+                    path.append(nb_node)
+                    advanced = True
+                    break
+                elif color[nb_node] == GRAY:
+                    # found a back-edge -> cycle
+                    idx = path.index(nb_node)
+                    cycle = ("CYCLE", path[idx:] + [nb_node])
+                    return False_result(cycle, block_m, bpo, num_m_blocks, num_n_blocks, k1d)
+            if not advanced:
+                color[node] = BLACK
+                stack.pop()
+                path.pop()
+    return {"deadlock": False, "block_m": block_m, "bpo": bpo,
+            "num_m_blocks": num_m_blocks, "num_n_blocks": num_n_blocks, "k1d": k1d,
+            "nodes": len(nodes)}
+
+
+def False_result(cycle, block_m, bpo, nmb, nnb, k1d):
+    return {"deadlock": True, "reason": cycle[0], "detail": cycle[1:],
+            "block_m": block_m, "bpo": bpo, "num_m_blocks": nmb,
+            "num_n_blocks": nnb, "k1d": k1d}
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--ranks", type=int, default=4)
+    p.add_argument("--sms", type=int, default=148)
+    p.add_argument("--tokens", type=str, default="512,1024,2048,4096,8192")
+    p.add_argument("--n", type=int, default=4096)
+    args = p.parse_args()
+
+    any_dead = False
+    for stagger in (True, False):
+        print(f"\n===== stagger={stagger} | R={args.ranks} SMs={args.sms} n={args.n} =====")
+        for m in (int(x) for x in args.tokens.split(",")):
+            if (m // args.ranks) == 0:
+                continue
+            r = detect_deadlock(args.ranks, args.sms, m, args.n, stagger=stagger)
+            tag = "DEADLOCK" if r["deadlock"] else "ok"
+            extra = ""
+            if r["deadlock"]:
+                any_dead = True
+                extra = f"  reason={r['reason']} detail={str(r['detail'])[:200]}"
+            print(f"  M={m:>6} block_m={r['block_m']:>3} bpo={r['bpo']} "
+                  f"m_blocks={r['num_m_blocks']} n_blocks={r['num_n_blocks']} "
+                  f"k1d={r['k1d']} nodes={r.get('nodes','?'):>6}  -> {tag}{extra}")
+    sys.exit(1 if any_dead else 0)

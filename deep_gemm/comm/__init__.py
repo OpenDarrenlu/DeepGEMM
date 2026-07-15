@@ -345,3 +345,101 @@ def bf16_gemm_reduce_scatter_ring(a: torch.Tensor,
     _C.reduce_scatter_ring(local_scratch, rs_buffer.buffer, rs_buffer.buffer_ptrs, rs_buffer.rank)
     rs_buffer.group.barrier()
     return rs_buffer.output
+
+
+class ReduceScatterRingFusedBuffer:
+    """Symmetric buffer for the FULLY FUSED BF16 GEMM + PUSH-RING reduce-scatter kernel
+    (`_C.bf16_gemm_reduce_scatter_ring_nt`).
+
+    Layout (single symmetric allocation, shared across ranks over NVLink):
+        [ barrier region (32 B) ]
+        [ output   : m_per_rank_pad x n  bf16 ]                 (END writes here)
+        [ ring recv: num_ranks x m_per_rank_pad x n  bf16 ]     (upstream running-sum, per owner)
+        [ flags    : num_m_blocks x num_n_blocks  int32 ]       (per-tile ready flag)
+
+    swap-AB padding mirrors `ReduceScatterBuffer`: token(M) is the UMMA N-dim tiled by
+    BLOCK_M=`rs_block_m(m_per_rank)`; each owner segment is padded to a multiple of BLOCK_M so
+    every tile is single-owner. `num_m_blocks = m_pad / BLOCK_M`, `num_n_blocks = n / 128`.
+    """
+
+    BARRIER_BYTES = 32
+    BLOCK_N = 128
+
+    def __init__(self, group: 'dist.ProcessGroup', m: int, n: int):
+        assert m % group.size() == 0, 'M must be divisible by world size'
+        assert n % self.BLOCK_N == 0, 'N must be a multiple of 128'
+        self.group = group
+        self.world_size = group.size()
+        self.rank = group.rank()
+        self.m, self.n = m, n
+        self.m_per_rank = m // self.world_size
+        self.block_m = rs_block_m(self.m_per_rank)
+        self.m_per_rank_pad = ((self.m_per_rank + self.block_m - 1) // self.block_m) * self.block_m
+        self.m_pad = self.m_per_rank_pad * self.world_size
+        self.num_m_blocks = self.m_pad // self.block_m
+        self.num_n_blocks = n // self.BLOCK_N
+
+        shard_elems = self.m_per_rank_pad * n
+        self._out_bytes = shard_elems * torch.bfloat16.itemsize
+        ring_bytes = self.world_size * shard_elems * torch.bfloat16.itemsize
+        flag_bytes = self.num_m_blocks * self.num_n_blocks * 4       # int32 per tile
+        num_bytes = self.BARRIER_BYTES + self._out_bytes + ring_bytes + flag_bytes
+
+        self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
+        self.handle = symm_mem.rendezvous(self.buffer, group=group)
+        self.buffer.zero_()
+        self.group.barrier()
+        torch.cuda.synchronize()
+
+    @property
+    def buffer_ptrs(self):
+        return self.handle.buffer_ptrs
+
+    @property
+    def output(self) -> torch.Tensor:
+        data = self.buffer[self.BARRIER_BYTES:self.BARRIER_BYTES + self._out_bytes]
+        padded = data.view(torch.bfloat16).view(self.m_per_rank_pad, self.n)
+        return padded[:self.m_per_rank]
+
+    def zero_(self):
+        # Ring + flags must be cleared every call (the kernel also self-resets flags at entry,
+        # but a full zero keeps the ring recv region clean for repeated launches).
+        self.buffer.zero_()
+        self.group.barrier()
+        torch.cuda.synchronize()
+
+    def destroy(self):
+        self.handle = None
+        self.buffer = None
+        self.group = None
+
+
+def bf16_gemm_reduce_scatter_ring_fused(a: torch.Tensor,
+                                        b: torch.Tensor,
+                                        rs_buffer: ReduceScatterRingFusedBuffer,
+                                        compiled_dims: str = 'nk') -> torch.Tensor:
+    """FULLY FUSED BF16 GEMM (`a @ b.T`) + PUSH-RING reduce-scatter (single kernel).
+
+    The ring reduction is folded into the GEMM epilogue's cross-rank transfer (bidirectional
+    NVLink, no local-scratch round-trip, no separate combine pass). Returns this rank's
+    `[M//world_size, N]` BF16 shard. swap-AB pads token(M) exactly like `ReduceScatterBuffer`.
+    """
+    rs_buffer.zero_()
+    m, k = a.shape
+    n, _ = b.shape
+    ws = rs_buffer.world_size
+    m_per_rank = rs_buffer.m_per_rank
+    m_per_rank_pad = rs_buffer.m_per_rank_pad
+
+    # Repack `a` into padded owner-segment layout [ws * m_per_rank_pad, K] (tail rows zeroed).
+    if m_per_rank_pad != m_per_rank:
+        if not a.is_contiguous():
+            a = a.contiguous()
+        a = a.view(ws, m_per_rank, k)
+        a = torch.nn.functional.pad(a, (0, 0, 0, m_per_rank_pad - m_per_rank))
+        a = a.reshape(ws * m_per_rank_pad, k)
+
+    _C.bf16_gemm_reduce_scatter_ring_nt(
+        a, b, rs_buffer.buffer, rs_buffer.buffer_ptrs, rs_buffer.rank, compiled_dims)
+    rs_buffer.group.barrier()
+    return rs_buffer.output

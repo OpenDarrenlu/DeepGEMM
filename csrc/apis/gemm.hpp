@@ -9,6 +9,7 @@
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm_reduce_scatter.hpp"
+#include "../jit_kernels/impls/sm100_bf16_gemm_reduce_scatter_ring.hpp"
 #include "../jit_kernels/impls/sm100_reduce_scatter_comm.hpp"
 #include "../jit_kernels/impls/sm100_reduce_scatter_comm_pull.hpp"
 #include "../jit_kernels/impls/sm100_reduce_scatter_ring.hpp"
@@ -428,6 +429,28 @@ static void bf16_gemm_reduce_scatter_nt(const torch::Tensor& a,
                                    m, n, k, major_a, major_b, compiled_dims);
 }
 
+// Fully fused BF16 GEMM + PUSH-RING reduce-scatter (no local_scratch: the ring reduction is
+// folded into the epilogue's cross-rank transfer). `out_sym_buffer` holds the BF16 output +
+// ring recv slots + per-tile flags (see the launcher).
+static void bf16_gemm_reduce_scatter_ring_nt(const torch::Tensor& a,
+                                             const torch::Tensor& b,
+                                             const torch::Tensor& out_sym_buffer,
+                                             const std::vector<int64_t>& sym_buffer_ptrs,
+                                             const int& rank,
+                                             const std::string& compiled_dims) {
+    const auto major_a = get_major_type_ab(a);
+    const auto major_b = get_major_type_ab(b);
+    const auto [m , k ] = get_shape<2>(a);
+    const auto [n , k_] = get_shape<2>(b);
+    DG_HOST_ASSERT(k == k_);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(b.scalar_type() == torch::kBFloat16);
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10 and "bf16_gemm_reduce_scatter_ring_nt only supports SM100");
+    sm100_bf16_gemm_reduce_scatter_ring(a, b, out_sym_buffer, sym_buffer_ptrs, rank,
+                                        m, n, k, major_a, major_b, compiled_dims);
+}
+
 static void reduce_scatter_comm(const torch::Tensor& local_scratch,
                                 const torch::Tensor& out_sym_buffer,
                                 const std::vector<int64_t>& sym_buffer_ptrs,
@@ -729,6 +752,10 @@ static void register_apis(pybind11::module_& m) {
           py::arg("compiled_dims") = "nk");
     m.def("bf16_gemm_reduce_scatter_nt", &bf16_gemm_reduce_scatter_nt,
           py::arg("a"), py::arg("b"), py::arg("local_scratch"), py::arg("out_sym_buffer"),
+          py::arg("sym_buffer_ptrs"), py::arg("rank"),
+          py::arg("compiled_dims") = "nk");
+    m.def("bf16_gemm_reduce_scatter_ring_nt", &bf16_gemm_reduce_scatter_ring_nt,
+          py::arg("a"), py::arg("b"), py::arg("out_sym_buffer"),
           py::arg("sym_buffer_ptrs"), py::arg("rank"),
           py::arg("compiled_dims") = "nk");
     m.def("reduce_scatter_comm", &reduce_scatter_comm,
